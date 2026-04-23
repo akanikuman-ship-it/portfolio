@@ -115,6 +115,9 @@
   .action-buy  { background: var(--green-bg); color: var(--green); }
   .action-hold { background: var(--surface2); color: var(--text3); }
   .action-detail { font-size: 11px; color: var(--text3); margin-top: 3px; }
+  .fee-line { font-size: 11px; margin-top: 4px; padding: 3px 7px; border-radius: 6px; line-height: 1.4; display: inline-block; }
+  .fee-worthy   { background: var(--green-bg); color: var(--green); }
+  .fee-unworthy { background: var(--amber-bg); color: var(--amber); }
 
   .footer { text-align: center; font-size: 12px; color: var(--text3); margin-top: 32px; line-height: 2; }
   .footer a { color: var(--text3); text-decoration: underline; }
@@ -198,7 +201,7 @@
 // ── 持股資料 ──────────────────────────────────────────────
 const TW = [
   { name: '元大台灣50',       code: '0050',   ticker: '0050.TW',   avg: 75.153846,  shares: 39   },
-  { name: '富邦台50',         code: '6208',   ticker: '6208.TW',   avg: 138.863481, shares: 293  },
+  { name: '富邦台50',         code: '006208',   ticker: '006208.TW',   avg: 138.863481, shares: 293  },
   { name: '國泰20年美債',     code: '00687B', ticker: '00687B.TW', avg: 30.062,     shares: 1000 },
   { name: '富邦公司治理',     code: '00692',  ticker: '00692.TW',  avg: 30.396,     shares: 1000 },
   { name: '元大投資級公司債', code: '00720B', ticker: '00720B.TW', avg: 35.945098,  shares: 1275 },
@@ -269,8 +272,70 @@ function setStatus(type, msg) {
   el.innerHTML = `<span class="status-dot ${cls}"></span>${msg}`;
 }
 
+// ── 手續費計算 ────────────────────────────────────────────
+// 台股：買賣各收 0.1425%×2.8折 = 0.0399%，最低1元；賣出加證交稅0.3%
+// 美股個股：買賣各收 0.08%（無低消）
+// 美股ETF（VOO/VTI）：買賣各收 3 USD 均一價
+const US_ETF_TICKERS = ['VOO', 'VTI'];
+
+function calcFee(isTW, ticker, shares, price, action) {
+  // action: 'buy' or 'sell'
+  const amount = shares * price;
+  if (isTW) {
+    const fee = Math.max(1, Math.round(amount * 0.001425 * 0.28));
+    const tax = action === 'sell' ? amount * 0.003 : 0;
+    return { fee, tax, total: fee + tax, currency: 'TWD' };
+  } else {
+    if (US_ETF_TICKERS.includes(ticker)) {
+      return { fee: 3, tax: 0, total: 3, currency: 'USD', isFlat: true };
+    }
+    const fee = amount * 0.0008;
+    return { fee, tax: 0, total: fee, currency: 'USD' };
+  }
+}
+
+function feeWorthiness(isTW, ticker, actionShares, actionPrice, avg, type) {
+  // 買：手續費 vs 若再漲5%的獲利
+  // 賣：手續費 vs 目前獲利
+  const tradeAmt = actionShares * actionPrice;
+  const buyFee  = calcFee(isTW, ticker, actionShares, actionPrice, 'buy');
+  const sellFee = calcFee(isTW, ticker, actionShares, actionPrice, 'sell');
+
+  if (type === 'sell') {
+    const profit = actionShares * (actionPrice - avg);
+    const totalCost = sellFee.total;
+    const netProfit = profit - totalCost;
+    const feeRatio = (totalCost / profit * 100);
+    const worthy = netProfit > 0 && feeRatio < 15;
+    const cur = sellFee.currency;
+    const feeStr = cur === 'USD'
+      ? (sellFee.isFlat ? `手續費 $3 USD 均一` : `手續費 $${sellFee.fee.toFixed(2)} USD`)
+      : `手續費 ${Math.round(sellFee.fee)}元＋稅 ${Math.round(sellFee.tax)}元`;
+    return {
+      worthy,
+      label: worthy ? '✓ 值得操作' : '✗ 不划算',
+      detail: `${feeStr}｜手續費佔獲利 ${feeRatio.toFixed(1)}%｜淨利約 ${cur==='USD'?'$'+netProfit.toFixed(2)+' USD':Math.round(netProfit)+'元'}`
+    };
+  } else {
+    // buy：手續費 vs 若漲回5%的獲利
+    const potentialGain = actionShares * actionPrice * 0.05;
+    const totalCost = buyFee.total;
+    const feeRatio = (totalCost / potentialGain * 100);
+    const worthy = feeRatio < 10;
+    const cur = buyFee.currency;
+    const feeStr = cur === 'USD'
+      ? (buyFee.isFlat ? `手續費 $3 USD 均一` : `手續費 $${buyFee.fee.toFixed(2)} USD`)
+      : `手續費 ${Math.round(buyFee.fee)}元`;
+    return {
+      worthy,
+      label: worthy ? '✓ 值得加買' : '✗ 手續費偏高',
+      detail: `${feeStr}｜佔預期回升獲利 ${feeRatio.toFixed(1)}%`
+    };
+  }
+}
+
 // ── 計算邏輯 ──────────────────────────────────────────────
-function calcAction(avg, shares, cp) {
+function calcAction(avg, shares, cp, isTW, ticker) {
   if (!cp || cp <= 0) return null;
   const pct = (cp - avg) / avg * 100;
   const sellTarget = avg * 1.05;
@@ -280,12 +345,14 @@ function calcAction(avg, shares, cp) {
   if (cp >= sellTarget) {
     const s = Math.floor(shares * 0.03 * 10000) / 10000;
     const sN = s >= 1 ? Math.floor(s) : s;
-    return { type:'sell', label:`賣出 ${fmtS(sN)} 股`, detail:`約 ${Math.round(sN*cp).toLocaleString()} 元`, pct };
+    const fee = feeWorthiness(isTW, ticker, sN, cp, avg, 'sell');
+    return { type:'sell', label:`賣出 ${fmtS(sN)} 股`, detail:`約 ${isTW ? Math.round(sN*cp).toLocaleString()+'元' : '$'+fmtN(sN*cp)+' USD'}`, fee, pct };
   }
   if (cp <= buyTarget) {
     const b = Math.floor(shares * 0.03 * 10000) / 10000;
     const bN = b >= 1 ? Math.floor(b) : b;
-    return { type:'buy', label:`加買 ${fmtS(bN)} 股`, detail:`約 ${Math.round(bN*cp).toLocaleString()} 元`, pct };
+    const fee = feeWorthiness(isTW, ticker, bN, cp, avg, 'buy');
+    return { type:'buy', label:`加買 ${fmtS(bN)} 股`, detail:`約 ${isTW ? Math.round(bN*cp).toLocaleString()+'元' : '$'+fmtN(bN*cp)+' USD'}`, fee, pct };
   }
   return { type:'hold', label:'持有觀望', detail:`賣點 ${fmt(sellTarget)} ／ 買點 ${fmt(buyTarget)}`, pct };
 }
@@ -295,6 +362,7 @@ function fmtN(n, d=2) { return n.toLocaleString('zh-TW', {minimumFractionDigits:
 
 // ── 渲染 ─────────────────────────────────────────────────
 function renderTable(stocks, tbodyId, isLoading) {
+  const isTW = tbodyId === 'tw-body';
   const tbody = document.getElementById(tbodyId);
   tbody.innerHTML = '';
 
@@ -304,12 +372,10 @@ function renderTable(stocks, tbodyId, isLoading) {
     const manual = manualOverride[key];
     const cp = manual !== undefined ? manual : cached;
 
-    // 股價欄位
     let priceHtml;
     if (isLoading) {
       priceHtml = `<div class="price-cell"><span class="price-val loading">抓取中…</span></div>`;
     } else {
-      const displayVal = cp ? fmtN(cp) : '';
       priceHtml = `<div class="price-cell">
         <input class="price-manual" type="number" step="0.01" min="0"
           value="${manual !== undefined ? fmtN(manual) : (cached ? fmtN(cached) : '')}"
@@ -319,7 +385,7 @@ function renderTable(stocks, tbodyId, isLoading) {
       </div>`;
     }
 
-    const action = cp ? calcAction(s.avg, s.shares, cp) : null;
+    const action = cp ? calcAction(s.avg, s.shares, cp, isTW, s.ticker) : null;
 
     let pctHtml = '<span style="color:var(--text3)">—</span>';
     if (action) {
@@ -330,7 +396,12 @@ function renderTable(stocks, tbodyId, isLoading) {
     let actionHtml = '<span style="color:var(--text3);font-size:12px">—</span>';
     if (action) {
       const cls = `action-${action.type}`;
-      actionHtml = `<span class="action-badge ${cls}">${action.label}</span><div class="action-detail">${action.detail}</div>`;
+      let feeHtml = '';
+      if (action.fee) {
+        const feeWorthyCls = action.fee.worthy ? 'fee-worthy' : 'fee-unworthy';
+        feeHtml = `<div class="fee-line ${feeWorthyCls}">${action.fee.label} — ${action.fee.detail}</div>`;
+      }
+      actionHtml = `<span class="action-badge ${cls}">${action.label}</span><div class="action-detail">${action.detail}</div>${feeHtml}`;
     }
 
     const codeHtml = s.code ? `<div class="name-code">${s.code}</div>` : '';
@@ -352,7 +423,8 @@ function updateSummary() {
     .forEach(({s,key}) => {
       const cp = manualOverride[key] ?? priceCache[s.ticker];
       if (!cp) return;
-      const a = calcAction(s.avg, s.shares, cp);
+      const isTW = key.startsWith('tw');
+      const a = calcAction(s.avg, s.shares, cp, isTW, s.ticker);
       if (!a) return;
       if (a.type==='sell') sell++;
       else if (a.type==='buy') buy++;
